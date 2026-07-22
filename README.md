@@ -111,6 +111,10 @@ GET /api/graph/social?person=某人
 
 Python · Neo4j (GDS) · DeepSeek API · Flask · Claude Code Skill
 
+## 致谢
+
+本项目受到 [ex-skill](https://github.com/perkfly/ex-skill) 的启发——将聊天记录蒸馏为 AI 对话人物的原始想法来自那里。SocialGraph 在此基础上将视角从单人扩展到整个社会网络。
+
 ## 许可证
 
 MIT
