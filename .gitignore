@@ -1,0 +1,37 @@
+# 敏感数据 — 绝对不上传
+聊天记录/
+tools/parsed_chats/
+backup/
+*.jsonl
+*.json
+!tools/*.json
+
+# API 密钥
+.env
+
+# 旧训练数据
+tools/finetune/
+
+# 含个人信息的 Skill
+exes/
+
+# Neo4j 数据库
+*.dump
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 根目录重复文件
+/graph_api.py

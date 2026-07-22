@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+聊天记录解析器 v2 — WeFlow JSON → 标准化消息对象
+
+支持批量解析整个目录的聊天记录。
+
+用法：
+    python chat_parser.py --file chat.json --target "谢渣渣" --output messages.jsonl
+    python chat_parser.py --all --dir 聊天记录/texts/                    # 批量模式
+    python chat_parser.py --file chat.json --target "谢渣渣" --format neo4j
+"""
+
+from __future__ import annotations
+
+import json
+import argparse
+import sys
+import os
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Optional
+
+
+def parse_weflow_json(file_path: str, target_name: str) -> list[dict]:
+    """解析 WeFlow 导出的 JSON 聊天记录。
+
+    返回标准化消息列表，每条消息包含：
+    - msg_id: 消息唯一标识 (localId)
+    - sender: 发送者昵称
+    - sender_role: 'target' | 'self' | 'system'
+    - content: 消息文本内容
+    - timestamp: ISO 格式时间
+    - formatted_time: 原始格式化时间
+    - msg_type: 文本消息 | 图片消息 | 视频消息 | 语音消息 | 表情消息 | 文件消息 | 系统消息
+    - is_send: 原始 isSend 值
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    session = data.get("session", {})
+    messages = data.get("messages", [])
+
+    target_wxid = session.get("wxid", "")
+    target_nickname = session.get("nickname", target_name)
+    target_display = session.get("displayName", target_name)
+
+    parsed = []
+    for msg in messages:
+        msg_id = msg.get("localId")
+        msg_type = msg.get("type", "未知消息")
+        content = (msg.get("content") or "").strip()
+        is_send = msg.get("isSend", -1)
+        sender_display = msg.get("senderDisplayName", "")
+        create_time = msg.get("createTime", 0)
+        formatted_time = msg.get("formattedTime", "")
+
+        # 确定 sender 角色
+        # 检测是否为群聊
+        is_group = (session.get("memberCount") or
+                    session.get("participants") or
+                    "群聊" in str(file_path))
+
+        if msg_type == "系统消息":
+            sender_role = "system"
+            sender_name = "系统"
+        elif is_group and is_send == 0:
+            # 群聊中别人发的——使用真实发送者名
+            sender_role = "group_member"
+            sender_name = sender_display or "未知群成员"
+        elif is_send == 0:
+            # 私聊中对方发的
+            sender_role = "target"
+            sender_name = target_display or target_nickname
+        elif is_send == 1:
+            # 用户自己发的 — 使用消息中的 senderDisplayName 而非 session.displayName
+            sender_role = "self"
+            sender_name = sender_display or "我"
+        else:
+            sender_role = "unknown"
+            sender_name = sender_display or "未知"
+
+        # P0-1: Name normalization — strip whitespace/newlines
+        sender_name = sender_name.strip().replace("\n", "").replace("\r", "")
+
+        # 跳过非文本但保留结构化信息
+        entry = {
+            "msg_id": msg_id,
+            "sender": sender_name,
+            "sender_role": sender_role,
+            "content": content,
+            "timestamp": datetime.fromtimestamp(
+                create_time, tz=timezone.utc
+            ).isoformat() if create_time else "",
+            "formatted_time": formatted_time,
+            "msg_type": msg_type,
+            "is_send": is_send,
+            "target_display": target_display,
+        }
+
+        parsed.append(entry)
+
+    return parsed
+
+
+def build_conversation_chains(messages: list[dict]) -> list[dict]:
+    """为每条消息构建 reply_to 关系。
+
+    规则：
+    - 回复关系基于时间相邻性 + sender_role 交替
+    - 相同 sender 连续发言 → 视为同一条链的延续
+    - 不同 sender 发言 → 视为回复上一条
+    """
+    chains = []
+    prev_msg = None
+
+    for msg in messages:
+        entry = dict(msg)
+        is_group = msg.get("sender_role") == "group_member"
+
+        if prev_msg:
+            prev_is_group = prev_msg.get("sender_role") == "group_member"
+            if is_group and prev_is_group:
+                # 群聊中：不同人发言 → 视为回复
+                if prev_msg["sender"] != msg["sender"]:
+                    entry["reply_to"] = prev_msg["msg_id"]
+                else:
+                    entry["reply_to"] = None
+            elif prev_msg["sender_role"] != msg["sender_role"]:
+                # 私聊中：角色交替 → 视为回复
+                entry["reply_to"] = prev_msg["msg_id"]
+            else:
+                entry["reply_to"] = None
+        else:
+            entry["reply_to"] = None
+
+        chains.append(entry)
+        prev_msg = msg
+
+    return chains
+
+
+def filter_text_only(messages: list[dict]) -> list[dict]:
+    """只保留文本消息（过滤系统消息、纯媒体消息）。"""
+    return [m for m in messages if m["msg_type"] == "文本消息" and m["content"]]
+
+
+def output_jsonl(messages: list[dict], output_path: str) -> None:
+    """输出为 JSONL 格式（每行一条 JSON）。"""
+    with open(output_path, "w", encoding="utf-8") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+
+def output_neo4j_cypher(messages: list[dict], output_path: str) -> None:
+    """输出为 Neo4j Cypher 导入脚本。
+
+    生成 UNWIND 批量导入语句，包含节点创建和 SAID/RECEIVED/REPLY_TO 关系。
+    """
+    # 分批：每 500 条一批
+    batch_size = 500
+    cypher_lines = [
+        "// Auto-generated Neo4j import script",
+        "// Generated by chat_parser.py",
+        "",
+        "// 1. Create constraints",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (m:Message) REQUIRE m.msg_id IS UNIQUE;",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.name IS UNIQUE;",
+        "",
+    ]
+
+    # Create Person nodes (target + self)
+    senders = set()
+    for msg in messages:
+        if msg["sender_role"] in ("target", "self"):
+            senders.add((msg["sender"], msg["sender_role"]))
+        elif msg["sender_role"] == "system":
+            senders.add(("系统", "system"))
+
+    cypher_lines.append("// 2. Create Person nodes")
+    person_lines = []
+    for name, role in senders:
+        person_lines.append(
+            f'  MERGE (:Person {{name: "{name}", role: "{role}"}});'
+        )
+    cypher_lines.extend(person_lines)
+    cypher_lines.append("")
+
+    # Create Message nodes in batches
+    cypher_lines.append("// 3. Create Message nodes")
+    for i in range(0, len(messages), batch_size):
+        batch = messages[i : i + batch_size]
+        batch_json = json.dumps(
+            [
+                {
+                    "msg_id": m["msg_id"],
+                    "content": m["content"],
+                    "timestamp": m["timestamp"],
+                    "formatted_time": m["formatted_time"],
+                    "msg_type": m["msg_type"],
+                }
+                for m in batch
+            ],
+            ensure_ascii=False,
+        )
+        batch_json_escaped = batch_json.replace("\\", "\\\\").replace('"', '\\"')
+        cypher_lines.append(f'UNWIND apoc.convert.fromJsonList("{batch_json_escaped}") AS row')
+        cypher_lines.append(
+            "CREATE (m:Message {"
+            "msg_id: row.msg_id, "
+            "content: row.content, "
+            "timestamp: row.timestamp, "
+            "formatted_time: row.formatted_time, "
+            "msg_type: row.msg_type"
+            "})"
+        )
+        cypher_lines.append("")
+        cypher_lines.append("// --- batch boundary ---")
+        cypher_lines.append("")
+
+    # Create SAID/RECEIVED relationships
+    cypher_lines.append("// 4. Create SAID/RECEIVED relationships")
+    for i in range(0, len(messages), batch_size):
+        batch = messages[i : i + batch_size]
+        for m in batch:
+            if m["sender_role"] == "target":
+                cypher_lines.append(
+                    f'MATCH (p:Person {{name: "{m["sender"]}"}}), '
+                    f'(msg:Message {{msg_id: {m["msg_id"]}}}) '
+                    f"CREATE (p)-[:SAID]->(msg);"
+                )
+            elif m["sender_role"] == "self":
+                cypher_lines.append(
+                    f'MATCH (p:Person {{name: "{m["sender"]}"}}), '
+                    f'(msg:Message {{msg_id: {m["msg_id"]}}}) '
+                    f"CREATE (p)-[:SAID]->(msg);"
+                )
+            elif m["sender_role"] == "system":
+                cypher_lines.append(
+                    f'MATCH (p:Person {{name: "系统"}}), '
+                    f'(msg:Message {{msg_id: {m["msg_id"]}}}) '
+                    f"CREATE (p)-[:SAID]->(msg);"
+                )
+        cypher_lines.append(f"// --- batch {i // batch_size + 1} relationships ---")
+
+    cypher_lines.append("")
+    cypher_lines.append("// 5. Create REPLY_TO relationships")
+    for i in range(0, len(messages), batch_size):
+        batch = messages[i : i + batch_size]
+        for m in batch:
+            if m.get("reply_to"):
+                cypher_lines.append(
+                    f'MATCH (m1:Message {{msg_id: {m["msg_id"]}}}), '
+                    f'(m2:Message {{msg_id: {m["reply_to"]}}}) '
+                    f"CREATE (m1)-[:REPLY_TO]->(m2);"
+                )
+        cypher_lines.append(f"// --- batch {i // batch_size + 1} reply_to ---")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(cypher_lines))
+
+    print(f"Neo4j Cypher script written to {output_path}")
+    print(f"  Total messages: {len(messages)}")
+    print(f"  Run with:  cat {output_path} | cypher-shell -u neo4j -p <password>")
+
+
+def detect_chat_type(file_path: str) -> str:
+    """检测聊天类型：private / group / unknown"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    session = data.get("session", {})
+    # 群聊通常有 memberCount 或 participants 字段
+    if session.get("memberCount") or session.get("participants"):
+        return "group"
+    # 私聊的 wxid 通常以 wxid_ 开头
+    wxid = session.get("wxid", "")
+    if wxid.startswith("wxid_"):
+        return "private"
+    return "unknown"
+
+
+def parse_all_in_directory(dir_path: str, text_only: bool = True) -> dict:
+    """批量解析目录下所有 WeFlow JSON 文件
+
+    Returns:
+        {filename: {"messages": [...], "chat_type": "private"|"group", "target": "...", "self": "..."}}
+    """
+    results = {}
+    json_files = sorted(Path(dir_path).glob("*.json"))
+
+    if not json_files:
+        print(f"目录 {dir_path} 下没有找到 JSON 文件")
+        return results
+
+    print(f"找到 {len(json_files)} 个聊天文件\n")
+
+    for fp in json_files:
+        fname = fp.name
+        print(f"📄 {fname}...", end=" ", flush=True)
+
+        try:
+            chat_type = detect_chat_type(str(fp))
+
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            session = data.get("session", {})
+            target_display = session.get("displayName", session.get("nickname", fname))
+
+            # 解析
+            messages = parse_weflow_json(str(fp), target_display)
+            messages = build_conversation_chains(messages)
+
+            if text_only:
+                messages = filter_text_only(messages)
+
+            # 统计
+            target_msgs = [m for m in messages if m["sender_role"] == "target"]
+            self_msgs = [m for m in messages if m["sender_role"] == "self"]
+            sys_msgs = [m for m in messages if m["sender_role"] == "system"]
+
+            # 获取 self 的名称
+            self_name = "我"
+            for m in self_msgs[:1]:
+                self_name = m.get("sender", "我")
+
+            results[fname] = {
+                "messages": messages,
+                "chat_type": chat_type,
+                "target": target_display,
+                "self": self_name,
+                "stats": {
+                    "total": len(messages),
+                    "target": len(target_msgs),
+                    "self": len(self_msgs),
+                    "system": len(sys_msgs),
+                },
+            }
+
+            print(f"{chat_type:8s} | 对方({target_display}): {len(target_msgs):5d} | "
+                  f"自己: {len(self_msgs):5d} | 系统: {len(sys_msgs):3d}")
+
+        except Exception as e:
+            print(f"❌ 解析失败: {e}")
+
+    return results
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Parse WeFlow chat JSON into standardized message objects"
+    )
+    parser.add_argument("--file", help="WeFlow JSON file path (single file mode)")
+    parser.add_argument("--target", help="Target person's display name (single file mode)")
+    parser.add_argument("--all", action="store_true", help="Batch mode: parse all JSON files in directory")
+    parser.add_argument("--dir", default="聊天记录/texts/", help="Directory for batch mode (default: 聊天记录/texts/)")
+    parser.add_argument(
+        "--format",
+        choices=["jsonl", "neo4j"],
+        default="jsonl",
+        help="Output format (default: jsonl)",
+    )
+    parser.add_argument("--output", default=None, help="Output file path (single file mode)")
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        default=True,
+        help="Only include text messages (default: True)",
+    )
+    parser.add_argument(
+        "--all-types",
+        action="store_true",
+        help="Include all message types (media, system, etc.)",
+    )
+    parser.add_argument(
+        "--outdir",
+        default="tools/parsed_chats/",
+        help="Output directory for batch mode (default: tools/parsed_chats/)",
+    )
+
+    args = parser.parse_args()
+
+    # ===== Batch mode =====
+    if args.all:
+        dir_path = args.dir
+        if not os.path.isdir(dir_path):
+            # Try relative to project root
+            alt_path = os.path.join(os.path.dirname(__file__), "..", dir_path)
+            if os.path.isdir(alt_path):
+                dir_path = os.path.abspath(alt_path)
+            else:
+                print(f"错误：目录不存在 {args.dir}", file=sys.stderr)
+                sys.exit(1)
+
+        results = parse_all_in_directory(dir_path, text_only=not args.all_types)
+
+        if not results:
+            print("没有成功解析的文件")
+            sys.exit(1)
+
+        # 输出汇总
+        print(f"\n{'='*60}")
+        print(f"批量解析完成: {len(results)} 个文件")
+        total_msgs = sum(r["stats"]["total"] for r in results.values())
+        total_target = sum(r["stats"]["target"] for r in results.values())
+        total_self = sum(r["stats"]["self"] for r in results.values())
+        print(f"  总消息: {total_msgs:,} | 对方: {total_target:,} | 自己: {total_self:,}")
+
+        # 保存汇总 JSON
+        outdir = Path(args.outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        summary = {}
+        all_messages = []  # merged output for loader
+        global_msg_id = 0
+
+        for fname, data in results.items():
+            # Re-assign global msg_ids to avoid collisions
+            for msg in data["messages"]:
+                global_msg_id += 1
+                msg["global_msg_id"] = global_msg_id
+                msg["source_file"] = fname
+
+            all_messages.extend(data["messages"])
+            summary[fname] = {
+                "chat_type": data["chat_type"],
+                "target": data["target"],
+                "self": data["self"],
+                "stats": data["stats"],
+            }
+
+        # Save merged messages
+        merged_path = outdir / "all_messages.jsonl"
+        output_jsonl(all_messages, str(merged_path))
+        print(f"  合并输出: {merged_path} ({len(all_messages):,} 条消息)")
+
+        # Save summary
+        summary_path = outdir / "chat_summary.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(f"  汇总信息: {summary_path}")
+
+        # Save per-file parsed outputs
+        for fname, data in results.items():
+            fout = outdir / f"{Path(fname).stem}_parsed.jsonl"
+            output_jsonl(data["messages"], str(fout))
+
+        return
+
+    # ===== Single file mode =====
+    if not args.file:
+        print("错误：需要 --file 或 --all 参数", file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    file_path = Path(args.file)
+    if not file_path.exists():
+        print(f"错误：文件不存在 {file_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Parsing {file_path}...")
+    messages = parse_weflow_json(str(file_path), args.target)
+    print(f"  Total messages: {len(messages)}")
+
+    # Build conversation chains
+    messages = build_conversation_chains(messages)
+
+    # Filter
+    if not args.all_types:
+        messages = filter_text_only(messages)
+        print(f"  Text messages only: {len(messages)}")
+
+    # Stats
+    target_msgs = [m for m in messages if m["sender_role"] == "target"]
+    self_msgs = [m for m in messages if m["sender_role"] == "self"]
+    system_msgs = [m for m in messages if m["sender_role"] == "system"]
+    print(f"  Target ({args.target}): {len(target_msgs)} messages")
+    print(f"  Self: {len(self_msgs)} messages")
+    print(f"  System: {len(system_msgs)} messages")
+
+    # Output
+    output_path = args.output or f"{file_path.stem}_parsed.jsonl"
+
+    if args.format == "neo4j":
+        output_path = output_path.replace(".jsonl", ".cypher")
+        output_neo4j_cypher(messages, output_path)
+    else:
+        output_jsonl(messages, output_path)
+        print(f"Parsed messages written to {output_path}")
+
+
+if __name__ == "__main__":
+    main()
