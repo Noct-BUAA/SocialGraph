@@ -1,53 +1,74 @@
-# SocialGraph — 基于聊天记录的社会网络构建与分析
+# SocialGraph — 基于社会关系网络的人物对话模拟
 
-从微信聊天记录中自动构建社交关系网络，支持 PageRank 分析、社区发现、关系强度量化、时序演化，以及网络感知的对话仿真。
+> **从一份聊天记录出发，构建整个社交网络，再让网络反哺对话——让 AI 不只是模仿一个人，而是理解她所处的整个世界。**
 
-## 架构
+## 起源
+
+这个项目始于一个看似 "不正经" 的尝试：把前任的微信聊天记录蒸馏成一个 AI Skill，让 Claude 模仿她的语气说话。它确实做到了——11467 条消息训练出的对话模型，能在 6-7 字、emoji 率 5.6% 的统计约束下，骗过认识她的人。
+
+但很快就碰到了天花板：**当对话中提到另一个人时，AI 只知道"赵云朋是sb"这样的事实标签，却不知道她和他互动过多少次、在哪个群里认识的、关系是什么强度、情绪是什么色调。**
+
+问题不在于数据不够——问题在于数据是孤立的。一份聊天记录只包含两个人的视角，而人是活在关系里的。
+
+## 核心洞察
+
+**一个人的语言风格不只是统计学特征——更是她的社会位置的函数。**
+
+她在不同人面前用不同的语气。她和室友聊到凌晨三点，和班主任说话不超过五个字。她在视频组群里吐槽领导，在班级群里只发"收到"。
+
+如果不知道她在社会网络中的位置，就不可能真正拟合她的对话。
+
+## 解决方案
+
+SocialGraph 把 **55 份聊天记录**（私聊 + 群聊）构建成一个 **260 人、6 万条消息的 Neo4j 社会关系网络**，然后用这个网络来增强对话仿真：
 
 ```
-WeChat 导出 (WeFlow JSON / TXT)
-    │
-    ▼
-chat_parser.py ─── 解析 → 标准化消息
-    │
-    ▼
-neo4j_loader.py ─── 导入 Neo4j
-    │
-    ▼
-batch_enrich_all.py ─── 情绪/人物/角色标注 (DeepSeek API)
-    │
-    ▼
-identity_resolver.py ─── 实体去重 (规则 + 图结构 + LLM)
-    │
-    ▼
-relationship_analyzer.py ─── 关系强度量化
-    │
-    ▼
-graph_analytics.py ─── PageRank / Louvain 社区发现 (GDS)
-    │
-    ▼
-temporal_evolution.py ─── 关系生命周期 + 月度热力图
+                    ┌──────────────────┐
+                    │  社会关系网络      │
+                    │  260 人 · 6 万消息 │
+                    │  PageRank · Louvain│
+                    └────────┬─────────┘
+                             │
+    ┌────────────────────────┼────────────────────────┐
+    │                        │                        │
+    ▼                        ▼                        ▼
+你提到赵云朋              你提到董佳蓂             你提到一个陌生人
+    │                        │                        │
+    ▼                        ▼                        ▼
+查网络: 强度58              查网络: 强度46            查网络: 无
+共同群: 交流群              共同群: 班会群             
+她的称呼: zyp              她的别名: 安步甲醚           
+    │                        │                        │
+    ▼                        ▼                        ▼
+回复: "他啊 烦得很"        回复: "哦 我们班的"        回复: "不认识"
+（冷淡吐槽，匹配强度）      （中性，匹配群熟人）       （诚实，而非瞎编）
 ```
+
+**三层信息融合**：
+
+| 层 | 来源 | 回答什么 |
+|------|------|---------|
+| 语义记忆 | Neo4j 关键词搜索 | "她说过什么" |
+| 社会网络 | PageRank + INTERACTS_WITH + 共同群聊 | "她和谁什么关系" |
+| 统计约束 | 11467 条消息的行为分布 | "她怎么说话" |
+
+## 与原始 "前任 Skill" 的区别
+
+| | 前任 Skill v1 | SocialGraph |
+|------|-------------|-------------|
+| 数据源 | 1 份私聊 | **55 份聊天** (私聊 + 群聊) |
+| 知识表示 | 静态 Markdown 列表 | **Neo4j 图数据库** |
+| 人物认知 | 硬编码标签 ("赵云朋是sb") | **动态关系查询** (强度/共同群/互动历史) |
+| 仿真方式 | 单人物统计拟合 | **网络感知**：关系强度驱动语气变化 |
+| 可扩展性 | 每增加一个人需重写 SKILL.md | **自动解析 → 自动建模** |
 
 ## 快速开始
 
-### 环境
-
-- Python 3.9+
-- Neo4j 2025.06+ (需 GDS 插件用于图算法)
-- DeepSeek API Key
-
 ```bash
 pip install neo4j openai flask
-```
+export DEEPSEEK_API_KEY=sk-...
 
-### 使用
-
-1. 用 WeFlow 导出微信聊天，放入 `聊天记录/texts/`
-2. 设置 `DEEPSEEK_API_KEY`
-
-```bash
-# 一键重建全流程
+# 一键重建
 python tools/rebuild_all.py
 
 # 或分步
@@ -60,37 +81,34 @@ python tools/graph_analytics.py --all
 python tools/temporal_evolution.py
 ```
 
-### 对话仿真
+## 分析能力
 
-部署 SKILL.md 为 Claude Code Skill，社会网络数据自动注入对话上下文。
+| 分析 | 工具 | 产出 |
+|------|------|------|
+| 社交中心度 | GDS PageRank | 谁是这个网络的核心 |
+| 社区发现 | GDS Louvain | 16 个自然圈子 |
+| 关系强度 | 对数缩放 | 4–150 的差异化谱系 |
+| 时序演化 | 月度聚合 | 关系断裂的精确时间点 |
+| 实体去重 | 规则+图+LLM | "赵云朋 = zyp = ZYP" |
 
-## 工具清单
+## 对话仿真 API
 
-| 脚本 | 功能 |
-|------|------|
-| `chat_parser.py` | WeFlow JSON / TXT → 标准化消息 |
-| `neo4j_loader.py` | 批量导入 Neo4j |
-| `batch_enrich_all.py` | 情绪 + 对话角色 + 人物标注 |
-| `context_enrich.py` | 上下文感知标注 |
-| `identity_resolver.py` | 跨聊天人物去重 |
-| `relationship_analyzer.py` | Person-Person 关系强度 |
-| `graph_analytics.py` | GDS PageRank + Louvain |
-| `temporal_evolution.py` | 月度热力图 + 生命周期 |
-| `graph_api.py` | Flask API (语义搜索 + 社会网络查询) |
-| `style_scorer.py` | 仿真回复风格检查 |
-| `eval_framework.py` | 五维量化评估 |
-| `ablation_test.py` | 组件贡献度消融实验 |
-| `annotation_reliability.py` | 标注信度检验 (Cohen's κ) |
-| `rebuild_all.py` | 一键重建全流程 |
+```python
+# graph_api.py 提供两个端点
 
-## 案例结果
+# Step 0: 语义记忆查询
+GET /api/graph/smart?query=你喜欢吃什么
 
-在 55 个聊天 (44 私聊 + 10 群聊 + 1 TXT)、260 人、60,000 条消息的数据集上：
+# Step 0.5: 社会网络上下文（新增）
+GET /api/graph/social?person=赵云朋
+# → {关系强度: 58, 共同群聊: [...] , Identity: 赵云朋 ← zyp}
+```
 
-- **PageRank**: 发现群聊中心人物和私聊中心人物的差异
-- **Louvain**: 16 个自然社区 (190 人大圈 + 53 人中圈 + 14 个微型组)
-- **关系强度**: 对数缩放的 4–150 谱系
-- **时序分析**: 精确定位关系断裂时间点
+部署为 Claude Code Skill 后，每次对话自动查询这两个端点，将语义记忆和社会关系上下文融合进回复生成。
+
+## 技术栈
+
+Python · Neo4j (GDS) · DeepSeek API · Flask · Claude Code Skill
 
 ## 许可证
 
