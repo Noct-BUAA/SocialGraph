@@ -21,7 +21,7 @@ from neo4j import GraphDatabase
 import argparse, sys, os, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from semantic_query import expand_keywords, TOPIC_EXPANSION, graph_semantic_search
+from semantic_query import expand_keywords, TOPIC_EXPANSION, graph_semantic_search, WORD_TO_TOPIC
 
 app = Flask(__name__)
 URI = "bolt://127.0.0.1:7687"
@@ -308,29 +308,29 @@ def smart_query():
     result["data"]["entities_found"] = entities
     matched_person = entities["persons"][0]["name"] if entities["persons"] else None
 
+    # 路由 1: 人物实体 → related + path
     if matched_person:
         result["routes_used"].append("related")
         with driver.session() as s:
-            # 谁提到这个人（按 speaker 分）
             r = s.run(
-                f"MATCH (p:Person)-[:SAID]->(m:Message) WHERE m.content CONTAINS '{matched_person}' "
+                "MATCH (p:Person)-[:SAID]->(m:Message) WHERE m.content CONTAINS $name "
                 "RETURN p.role AS speaker, count(m) AS cnt, collect(m.content)[0..3] AS samples",
+                name=matched_person,
             )
             result["data"]["mentions_by_speaker"] = [dict(rec) for rec in r]
 
-            # 共现人物
             r2 = s.run(
-                f"MATCH (m:Message) WHERE m.content CONTAINS '{matched_person}' "
+                "MATCH (m:Message) WHERE m.content CONTAINS $name "
                 "MATCH (m)-[:ABOUT]->(t:Topic) "
                 "WITH t, count(m) AS cnt RETURN t.name AS topic, cnt ORDER BY cnt DESC LIMIT 5",
+                name=matched_person,
             )
             result["data"]["related_topics"] = [dict(rec) for rec in r2]
 
-        # 也跑 path（她跟这个人的互动链）
         result["routes_used"].append("path")
         with driver.session() as s:
             r3 = s.run(
-                f"MATCH (p1:Person {{role:'target'}})-[:SAID]->(m1:Message) WHERE m1.content CONTAINS '{matched_person}' "
+                "MATCH (p1:Person {role:'target'})-[:SAID]->(m1:Message) WHERE m1.content CONTAINS $name "
                 "MATCH (p2:Person {role:'self'})-[:SAID]->(m2:Message) WHERE m2.content CONTAINS $name "
                 "AND abs(m1.msg_id - m2.msg_id) < 10 "
                 "RETURN m1.content AS her_msg, m2.content AS your_msg, m1.msg_id AS mid "
@@ -342,10 +342,8 @@ def smart_query():
     # 路由 2: 时间/趋势查询
     if any(kw in query for kw in TIME_KEYWORDS):
         result["routes_used"].append("temporal")
-        # 找到相关 topic
-        l1, _ = expand_keywords(query)
         topics_to_check = list(set(
-            t for word, topics in __import__('semantic_query', fromlist=['WORD_TO_TOPIC']).WORD_TO_TOPIC.items()
+            t for word, topics in WORD_TO_TOPIC.items()
             if word in query for t in topics
         ))[:3]
         temporal_data = {}
@@ -370,7 +368,7 @@ def smart_query():
             for r in results
         ]
 
-    # 附加：当前会话状态
+    # 附加：当前会话状态（复用最后一个 session 或新开一个）
     with driver.session() as s:
         r = s.run("MATCH (s:ConversationSession {id: $sid}) RETURN s", sid=SESSION_ID)
         rec = r.single()
